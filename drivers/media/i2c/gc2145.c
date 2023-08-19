@@ -26,11 +26,23 @@
 #define GC2145_REG_ANALOG_MODE1	0x17
 #define GC2145_REG_OUTPUT_FMT	0x84
 #define GC2145_REG_SYNC_MODE	0x86
+
+#define GC2145_SYNC_MODE_VSYNC_POL	BIT(0)
+#define GC2145_SYNC_MODE_HSYNC_POL	BIT(1)
+#define GC2145_SYNC_MODE_OPCLK_POL	BIT(2)
+#define GC2145_SYNC_MODE_OPCLK_GATE	BIT(3)
 #define GC2145_SYNC_MODE_COL_SWITCH	BIT(4)
 #define GC2145_SYNC_MODE_ROW_SWITCH	BIT(5)
+
 #define GC2145_REG_DEBUG_MODE2	0x8c
 #define GC2145_REG_DEBUG_MODE3	0x8d
 #define GC2145_REG_CHIP_ID	0xf0
+#define GC2145_REG_PAD_IO	0xf2
+#define GC2145_REG_PLL_MODE1		0xf7
+#define GC2145_REG_PLL_MODE2		0xf8
+#define GC2145_REG_CM_MODE		0xf9
+#define GC2145_REG_CLK_DIV_MODE		0xfa
+#define GC2145_REG_ANALOG_PWC		0xfc
 #define GC2145_REG_PAGE_SELECT	0xfe
 /* Page 3 */
 #define GC2145_REG_FIFO_FULL_LVL_LOW	0x04
@@ -981,7 +993,7 @@ struct gc2145_ctrls {
 struct gc2145 {
 	struct v4l2_subdev sd;
 	struct media_pad pad;
-
+	struct v4l2_fwnode_endpoint ep; /* the parsed DT endpoint info */
 	struct v4l2_mbus_framefmt fmt;
 
 	struct clk *xclk;
@@ -1005,6 +1017,12 @@ struct gc2145 {
 	/* Streaming on/off */
 	bool streaming;
 };
+
+
+static inline bool gc2145_is_csi2(const struct gc2145 *sensor)
+{
+	return sensor->ep.bus_type == V4L2_MBUS_CSI2_DPHY;
+}
 
 static inline struct gc2145 *to_gc2145(struct v4l2_subdev *_sd)
 {
@@ -1302,6 +1320,30 @@ static int gc2145_set_pad_format(struct v4l2_subdev *sd, struct v4l2_subdev_stat
 	return 0;
 }
 
+static int gc2145_set_dvp_pclk(struct gc2145 *sensor)
+{
+	/* TODO pclk calculation */
+	gc2145_write_reg(sensor, GC2145_REG_CLK_DIV_MODE, 0x10);
+	gc2145_write_reg(sensor, GC2145_REG_CM_MODE, 0xfe);
+	return 0;
+}
+
+
+static int gc2145_set_mipi_pclk(struct gc2145 *sensor)
+{
+	return 0;
+}
+
+static int gc2145_set_stream_dvp(struct gc2145 *sensor, bool on)
+{
+	return gc2145_write_reg(sensor, GC2145_REG_PAD_IO, on ? 0x0f : 0);
+}
+
+static int gc2145_set_stream_mipi(struct gc2145 *sensor, bool on)
+{
+	return 0;
+}
+
 static int gc2145_start_streaming(struct gc2145 *gc2145)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(&gc2145->sd);
@@ -1309,6 +1351,7 @@ static int gc2145_start_streaming(struct gc2145 *gc2145)
 	const struct gc2145_format *gc2145_format;
 	uint16_t lwc, fifo_full_lvl, fifo_gate_mode;
 	u8 sync_mode;
+	int flags;
 	int ret;
 
 	ret = pm_runtime_resume_and_get(&client->dev);
@@ -1345,10 +1388,33 @@ static int gc2145_start_streaming(struct gc2145 *gc2145)
 	if (ret)
 		return ret;
 
+	if (!gc2145_is_csi2(gc2145)) {
+		flags = gc2145->ep.bus.parallel.flags;
+
+		sync_mode &= ~(GC2145_SYNC_MODE_VSYNC_POL |
+			GC2145_SYNC_MODE_HSYNC_POL |
+			GC2145_SYNC_MODE_OPCLK_POL);
+
+		if (flags & V4L2_MBUS_VSYNC_ACTIVE_LOW)
+			sync_mode |= GC2145_SYNC_MODE_VSYNC_POL;
+
+		if (flags & V4L2_MBUS_HSYNC_ACTIVE_LOW)
+			sync_mode |= GC2145_SYNC_MODE_HSYNC_POL;
+
+		if (flags & V4L2_MBUS_PCLK_SAMPLE_FALLING)
+			sync_mode |= GC2145_SYNC_MODE_OPCLK_POL;
+	}
 	sync_mode &= ~(GC2145_SYNC_MODE_COL_SWITCH | GC2145_SYNC_MODE_ROW_SWITCH);
 	sync_mode |= gc2145_format->row_col_switch;
-
+	/* dev_err(&client->dev, "sync_mode %d\n", sync_mode); */
 	ret = gc2145_write_reg(gc2145, GC2145_REG_SYNC_MODE, sync_mode);
+	if (ret)
+		return ret;
+
+	if (gc2145_is_csi2(gc2145))
+		ret = gc2145_set_mipi_pclk(gc2145);
+	else
+		ret = gc2145_set_dvp_pclk(gc2145);
 	if (ret)
 		return ret;
 
@@ -1423,6 +1489,13 @@ static int gc2145_start_streaming(struct gc2145 *gc2145)
 	if (ret)
 		return ret;
 
+	if (gc2145_is_csi2(gc2145))
+		ret = gc2145_set_stream_mipi(gc2145, true);
+	else
+		ret = gc2145_set_stream_dvp(gc2145, true);
+	if (ret)
+		return ret;
+
 	/* Apply customized values from user */
 	ret =  __v4l2_ctrl_handler_setup(&gc2145->ctrls.handler);
 	if (ret)
@@ -1439,11 +1512,10 @@ static void gc2145_stop_streaming(struct gc2145 *gc2145)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(&gc2145->sd);
 
-	/*
-	 * TODO - once we have a way to turn off only streaming of the
-	 * sensor, we will have to do it here.
-	 */
-
+	if (gc2145_is_csi2(gc2145))
+		gc2145_set_stream_mipi(gc2145, false);
+	else
+		gc2145_set_stream_dvp(gc2145, false);
 	pm_runtime_put(&client->dev);
 }
 
@@ -1705,12 +1777,14 @@ static int gc2145_set_ctrl_test_pattern(struct gc2145 *gc2145, int value)
 
 static int gc2145_set_ctrl_hflip(struct gc2145 *gc2145, int value)
 {
+	gc2145_write_reg(gc2145, GC2145_REG_PAGE_SELECT, 0x00);
 	return gc2145_mod_reg(gc2145, GC2145_REG_ANALOG_MODE1,
 			      BIT(0), (value ? BIT(0) : 0));
 }
 
 static int gc2145_set_ctrl_vflip(struct gc2145 *gc2145, int value)
 {
+	gc2145_write_reg(gc2145, GC2145_REG_PAGE_SELECT, 0x00);
 	return gc2145_mod_reg(gc2145, GC2145_REG_ANALOG_MODE1,
 			      BIT(1), (value ? BIT(1) : 0));
 }
@@ -1806,9 +1880,8 @@ static void gc2145_free_controls(struct gc2145 *gc2145)
 static int gc2145_check_hwcfg(struct device *dev)
 {
 	struct fwnode_handle *endpoint;
-	struct v4l2_fwnode_endpoint ep_cfg = {
-		.bus_type = V4L2_MBUS_CSI2_DPHY
-	};
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct gc2145 *gc2145 = to_gc2145(sd);
 	int ret = -EINVAL;
 
 	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
@@ -1817,23 +1890,22 @@ static int gc2145_check_hwcfg(struct device *dev)
 		return -EINVAL;
 	}
 
-	if (v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep_cfg)) {
+	if (v4l2_fwnode_endpoint_parse(endpoint, &gc2145->ep)) {
 		dev_err(dev, "could not parse endpoint\n");
 		goto error_out;
 	}
+	/* fwnode_handle_put(endpoint); */
 
-	/* Check the number of MIPI CSI2 data lanes */
-	if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2) {
-		dev_err(dev, "only 2 data lanes are currently supported\n");
-		goto error_out;
+	if (gc2145_is_csi2(gc2145)) {
+		/* Check the number of MIPI CSI2 data lanes */
+		if (gc2145->ep.bus.mipi_csi2.num_data_lanes != 2) {
+			dev_err(dev, "only 2 data lanes are currently supported\n");
+			goto error_out;
+		}
 	}
 
 	ret = 0;
-
 error_out:
-	v4l2_fwnode_endpoint_free(&ep_cfg);
-	fwnode_handle_put(endpoint);
-
 	return ret;
 }
 
